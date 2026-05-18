@@ -79,7 +79,7 @@ def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/
             if block.type == "tool_use":
                 print(f"\033[33m$ {block.input['command']}\033[0m")
                 # 这里的command是LLM命令  eg:"command": "dir" 这是bash工具里面的工具
-                # 因为现在只有bash一个工具  直接传给run_bash
+                # 因为现在只有bash一个工具  直接传给run_bash 不需要工具映射表
                 output = run_bash(block.input['command'])
                 print(output[:200])
                 results.append({"type":"tool_result","tool_use_id":block.id,"content":output})
@@ -92,7 +92,7 @@ if __name__ == "__main__":
     while True:  # 实现用户和agent无限聊天
         try:
             # 真正的用户输入
-            query = input("\033[36ms01>>\033[0m")
+            query = input("\033[36mv01>>\033[0m")
         except(EOFError, KeyboardInterrupt):  # 用户按ctrl+c可以退出
             break
         if query.strip().lower() in ("q", "exit", ""):  # 输入q/exit 可以退出
