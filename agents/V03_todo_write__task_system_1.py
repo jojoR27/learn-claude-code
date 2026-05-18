@@ -1,6 +1,8 @@
-'''V02版本的agent实现内容：
-        1.新增三个工具(TOOL)，read、write、edit
-        2.新建工具映射表tool_handlers，统一管理工具
+'''V03版本的agent实现内容：
+        1.todo_write: 让LLM给程序传命令前，生成一个todo表以便后续操作不是想到什么干什么，存放在内存中重启程序todo表就消失了！！
+        2.task_system: 把原来内存里的todo，拆成一个个持久化的 task，保存到硬盘
+        （_1中仅实现todo任务清单，task在_2中实现）
+
         对应关系：bash---run_bash()
                 read_file---run_read()
                 write_file---run_write()
@@ -31,7 +33,51 @@ MODEL = os.getenv("MODEL_ID")
 WORKDIR = Path.cwd()
 
 # agent身份描述
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+          Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+          Prefer tools over prose."""
+
+# 把todo列表相关操作封装成一个类
+class TodoManager:
+    # 初始化：创建一个空的任务列表
+    def __init__(self):
+        self.items = []
+
+    def update(self, items: list) -> str:
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i+1)))
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+            if status not in("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id}: invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+        self.items = validated
+        return self.render()
+
+    # 渲染任务格式
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[×]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for item in self.items if item["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+# 创建一个全局唯一的任务清单实例
+TODO = TodoManager()
 
 # 强制LLM只能在当前目录操作
 def safe_path(p:str) -> Path:
@@ -104,6 +150,7 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_content"], kw["new_content"]),
+    "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
 # 工具列表 LLM看
@@ -132,10 +179,17 @@ TOOLS = [
          "type":"object",
          "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}},
          "required": ["path", "old_text", "new_text"]}},
+    {"name": "todo",
+     "description": "Update task list. Track progress on multi-step tasks.",
+     "input_schema": {
+         "type":"object",
+         "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}},
+         "required": ["items"]}},
 ]
 
 # 循环控制程序不断操作
 def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/上下文 同时也包括用户输入
+    rounds_since_todo = 0
     while True:
         # 发给LLM生成命令  命令存到response中
         response = client.messages.create(
@@ -151,13 +205,23 @@ def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/
         if response.stop_reason != "tool_use":
             return
         results = []
+        used_todo = False
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error:{e}"
                 print(f"> {block.name}:")
                 print(output[:200])
-                results.append({"type":"tool_result","tool_use_id":block.id,"content":output})
+                results.append({"type":"tool_result","tool_use_id":block.id,"content":str(output)})
+                # 连续 3 轮不更新todo就催LLM更新
+                if block.name == "todo":
+                    used_todo = True
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         # 把结果加入到上下文
         messages.append({"role":"user", "content":results})
 
@@ -167,7 +231,7 @@ if __name__ == "__main__":
     while True:  # 实现用户和agent无限聊天
         try:
             # 真正的用户输入
-            query = input("\033[36mv02>>\033[0m")
+            query = input("\033[36mv03>>\033[0m")
         except(EOFError, KeyboardInterrupt):  # 用户按ctrl+c可以退出
             break
         if query.strip().lower() in ("q", "exit", ""):  # 输入q/exit 可以退出
