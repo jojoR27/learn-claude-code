@@ -7,13 +7,17 @@
                 read_file---run_read()
                 write_file---run_write()
                 edit_file---run_edit()
-                todo---TodoManager.update()'''
+                task_create---TaskManager.create()
+                task_update---TaskManager.update()
+                task_list--- TaskManager.list_all()
+                task_get---TaskManager.get()'''
 
 
 
 import os          # os 库就是 Python 和「操作系统」对话的工具，例如读取环境变量
 import subprocess  # 让 Python 执行系统命令（cmd /bash 命令）
 from pathlib import Path  # 用于后面限制文件操作的
+import json   # 用来读写task.json文件
 
 from anthropic import Anthropic
 from dotenv import load_dotenv  # 这是加载 .env 环境变量的工具
@@ -32,53 +36,99 @@ MODEL = os.getenv("MODEL_ID")
 
 # 固定LLM的工作目录 为当前目录
 WORKDIR = Path.cwd()
+TASKS_DIR = WORKDIR / ".tasks"
 
 # agent身份描述
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-          Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-          Prefer tools over prose."""
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
 
-# 把todo列表相关操作封装成一个类
-class TodoManager:
-    # 初始化：创建一个空的任务列表
-    def __init__(self):
-        self.items = []
+# task相关操作封装成一个类
+class TaskManager:
+    # 初始化：创建/索引json文件路径/ID
+    def __init__(self, tasks_dir:Path):
+        self.dir = tasks_dir
+        self.dir.mkdir(exist_ok=True)
+        self._next_id = self._max_id() + 1
 
-    def update(self, items: list) -> str:
-        if len(items) > 20:
-            raise ValueError("Max 20 todos allowed")
-        validated = []
-        in_progress_count = 0
-        for i, item in enumerate(items):
-            text = str(item.get("text", "")).strip()
-            status = str(item.get("status", "pending")).lower()
-            item_id = str(item.get("id", str(i+1)))
-            if not text:
-                raise ValueError(f"Item {item_id}: text required")
-            if status not in("pending", "in_progress", "completed"):
-                raise ValueError(f"Item {item_id}: invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item_id, "text": text, "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress at a time")
-        self.items = validated
-        return self.render()
+    # 给task标序号
+    def _max_id(self) -> int:
+        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
+        return max(ids) if ids else 0
 
-    # 渲染任务格式
-    def render(self) -> str:
-        if not self.items:
-            return "No todos."
+    # 读取json文件内容
+    def _load(self, task_id: int) -> dict:
+        path = self.dir/f"task_{task_id}.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        # 读取并把json转成字典
+        return json.loads(path.read_text())
+
+    def _save(self, task: dict):
+        path = self.dir/f"task_{task['id']}.json"
+        # 字典转为json格式
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+
+    def create(self, subject: str, description: str) -> str:
+        task={
+            "id": self._next_id,  # 任务编号
+            "subject": subject,   # 任务标题
+            "description": description,  # 任务详情
+            "status": "pending",  # 状态
+            "blockedBy": [],      # 依赖任务/父任务
+            "owner": "",          # 执行者
+        }
+        self._save(task)
+        self._next_id += 1
+        # json 格式给LLM看
+        return json.dumps(task, indent=2, ensure_ascil=False)
+
+    def get(self, task_id: int) -> str:
+        # 加载单个任务 json格式
+        return json.dumps(self._load(task_id), indet=2, ensure_ascil=False)
+
+    def update(self, task_id: int, status: str = None,
+               add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
+        task = self._load(task_id)
+        if status:
+            if status not in ("pending", "in_progress", "complected"):
+                raise ValueError(f"Invalid status: {status}")
+            task["status"] = status
+            if status == "completed":
+                self._clear_dependency(task_id)
+            if add_blocked_by:
+                task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+            if remove_blocked_by:
+                task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
+            self._save(task)
+            return json.dumps(task, indent=2, ensure_ascil=False)
+
+    # 清空依赖
+    def _clear_dependency(self, completed_id: int):
+        for f in self.dir.glob("task_*.json"):
+            task = json.loads(f.read_text())
+            if completed_id in task.get("blockedBy", []):
+                task["blockedBy"].remove(completed_id)
+                self._save(task)
+
+    # 列给LLM看所以任务
+    def list_all(self) -> str:
+        tasks = []
+        files = sorted(
+            self.dir.glob("task_*.json"),
+            key=lambda f: int(f.stem.split("_")[1])
+        )
+        for f in files:
+            tasks.append(json.loads(f.read_text()))
+        if not tasks:
+            return "No tasks found"
         lines = []
-        for item in self.items:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[×]"}[item["status"]]
-            lines.append(f"{marker} #{item['id']}: {item['text']}")
-        done = sum(1 for item in self.items if item["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
+        for t in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[X]"}.get(t["status"], "[?]")
+            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
         return "\n".join(lines)
 
-# 创建一个全局唯一的任务清单实例
-TODO = TodoManager()
+# 创建全局任务管理器实例
+TASKS = TaskManager(TASKS_DIR)
 
 # 强制LLM只能在当前目录操作
 def safe_path(p:str) -> Path:
@@ -151,7 +201,10 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_content"], kw["new_content"]),
-    "todo": lambda **kw: TODO.update(kw["items"]),
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get["status"]),
+    "task_list": lambda **kw: TASKS.list_all(),
+    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
 }
 
 # 工具列表 LLM看
@@ -180,17 +233,33 @@ TOOLS = [
          "type":"object",
          "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}},
          "required": ["path", "old_text", "new_text"]}},
-    {"name": "todo",
-     "description": "Update task list. Track progress on multi-step tasks.",
+    {"name": "task_create",
+     "description": "Create a new task.",
      "input_schema": {
          "type":"object",
-         "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}},
-         "required": ["items"]}},
+         "properties": {"subject": {"type": "string"}, "description": {"type": "string"}},
+         "required": ["subject"]}},
+    {"name": "task_update",
+     "description": "Update a task's status or dependencies.",
+     "input_schema": {
+         "type":"object",
+         "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "addBlockedBy": {"type": "array", "items": {"type": "integer"}}, "removeBlockedBy": {"type": "array", "items": {"type": "integer"}}},
+         "required": ["task_id"]}},
+    {"name": "task_list",
+     "description": "List all tasks with status summary.",
+     "input_schema": {
+         "type":"object",
+         "properties": {}}},
+    {"name": "task_get",
+     "description": "Get full details of a task by ID.",
+     "input_schema": {
+         "type":"object",
+         "properties": {"task_id": {"type": "integer"}},
+         "required": ["task_id"]}},
 ]
 
 # 循环控制程序不断操作
 def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/上下文 同时也包括用户输入
-    rounds_since_todo = 0
     while True:
         # 发给LLM生成命令  命令存到response中
         response = client.messages.create(
@@ -206,7 +275,6 @@ def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/
         if response.stop_reason != "tool_use":
             return
         results = []
-        used_todo = False
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
@@ -217,12 +285,6 @@ def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/
                 print(f"> {block.name}:")
                 print(output[:200])
                 results.append({"type":"tool_result","tool_use_id":block.id,"content":str(output)})
-                # 连续 3 轮不更新todo就催LLM更新
-                if block.name == "todo":
-                    used_todo = True
-        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        if rounds_since_todo >= 3:
-            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         # 把结果加入到上下文
         messages.append({"role":"user", "content":results})
 
