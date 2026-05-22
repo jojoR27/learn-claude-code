@@ -1,7 +1,5 @@
-'''V03版本的agent实现内容：
-        1.todo_write: 让LLM给程序传命令前，生成一个todo表以便后续操作不是想到什么干什么，存放在内存中重启程序todo表就消失了！！
-        2.task_system: 把原来内存里的todo，拆成一个个持久化的 task，保存到硬盘
-        （_1中仅实现todo任务清单，task在_2中实现）
+'''V04版本的agent实现内容：
+        1.subagent:"大任务拆小, 每个小任务干净的上下文" -- Subagent 用独立 messages[], 不污染主对话, 守护模型的思维清晰度。
 
         对应关系：bash---run_bash()
                 read_file---run_read()
@@ -10,7 +8,8 @@
                 task_create---TaskManager.create()
                 task_update---TaskManager.update()
                 task_list--- TaskManager.list_all()
-                task_get---TaskManager.get()'''
+                task_get---TaskManager.get()
+                task---run_subagent() # 单独的派生子代理工具 映射关系没写在工具映射表中直接写死在agent_loop中了'''
 
 
 
@@ -38,8 +37,12 @@ MODEL = os.getenv("MODEL_ID")
 WORKDIR = Path.cwd()
 TASKS_DIR = WORKDIR / ".tasks"
 
-# agent身份描述
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
+# 父agent身份描述
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use task management tools to plan and track work.
+Use the task tool to spawn subagent and handle complex subtasks."""
+# subagent_prompt
+SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 # task相关操作封装成一个类
 class TaskManager:
@@ -151,7 +154,12 @@ def run_bash(command:str)->str:   # python语法：输入一个字符串(LLM给�
                            cwd=os.getcwd(),
                            capture_output=True,
                            text=True,
-                           timeout=120)
+                           timeout=120,
+                           encoding='utf-8',
+                           errors='replace'
+                           )
+        out = r.stdout if r.stdout else ""
+        err = r.stderr if r.stderr else ""
         out = (r.stdout + r.stderr).strip()
         # 返回给LLM结果 太长就截断
         return out[:5000] if out else "(no output)"
@@ -195,6 +203,32 @@ def run_edit(path: str, old_content: str, new_content: str) -> str:
     except Exception as e:
         return f"Error:{e}"
 
+# 对应工具task 派生子进程
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}] # 干净的上下文
+    print(f"  [subagent] 开始执行任务: {prompt[:50]}...")
+    for i in range(30):
+        print(f"  [subagent] 第 {i + 1} 轮思考...")
+        # 子Agent的单次输出
+        response = client.messages.create(
+            model = MODEL,
+            system = SUBAGENT_SYSTEM,
+            messages = sub_messages,
+            tools = CHILD_TOOLS,
+            max_tokens=8000,
+        )
+        sub_messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+        sub_messages.append({"role": "user", "content": results})
+    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+
 # 工具映射表
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
@@ -202,13 +236,13 @@ TOOL_HANDLERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_content"], kw["new_content"]),
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
+    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"),kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(kw["task_id"]),
 }
 
-# 工具列表 LLM看
-TOOLS = [
+# subagent 工具列表
+CHILD_TOOLS = [
     {"name": "bash",
      "description": "Run a shell command",
      "input_schema": {
@@ -233,6 +267,10 @@ TOOLS = [
          "type":"object",
          "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}},
          "required": ["path", "old_text", "new_text"]}},
+]
+
+# 工具列表 LLM看
+TOOLS = CHILD_TOOLS + [
     {"name": "task_create",
      "description": "Create a new task.",
      "input_schema": {
@@ -256,6 +294,12 @@ TOOLS = [
          "type":"object",
          "properties": {"task_id": {"type": "integer"}},
          "required": ["task_id"]}},
+    {"name": "task",  # 这个task工具和run_subagent()的映射关系没写在映射表中，直接在agent_loop中写死了
+     "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+     "input_schema": {
+         "type":"object",
+         "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}},
+         "required": ["prompt"]}},
 ]
 
 # 循环控制程序不断操作
@@ -277,13 +321,16 @@ def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
+                # 派生子agent单独对应
+                if block.name == "task":
+                    desc = block.input.get("description", "subtask")
+                    prompt = block.input.get("prompt", "")
+                    print(f"> task ({desc}): {prompt[:80]}")
+                    output = run_subagent(prompt)
+                else:
+                    handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error:{e}"
-                print(f"> {block.name}:")
-                print(output[:200])
+                print(f"    {str(output)[:200]}")
                 results.append({"type":"tool_result","tool_use_id":block.id,"content":str(output)})
         # 把结果加入到上下文
         messages.append({"role":"user", "content":results})
@@ -294,7 +341,7 @@ if __name__ == "__main__":
     while True:  # 实现用户和agent无限聊天
         try:
             # 真正的用户输入
-            query = input("\033[36mv03>>\033[0m")
+            query = input("\033[36mv04>>\033[0m")
         except(EOFError, KeyboardInterrupt):  # 用户按ctrl+c可以退出
             break
         if query.strip().lower() in ("q", "exit", ""):  # 输入q/exit 可以退出

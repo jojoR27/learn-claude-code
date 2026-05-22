@@ -1,0 +1,8 @@
+{
+  "id": 1,
+  "subject": "Find testing framework",
+  "description": "Investigate what testing framework this project uses by examining requirements.txt, README.md, and other project files",
+  "status": "in_progress",
+  "blockedBy": [],
+  "owner": ""
+}
