@@ -1,4 +1,4 @@
-'''V05版本的agent实现内容：
+'''V05版本的agent实现内容（基于v02版本）：
         1.skill.md: Agent的外挂知识包/技能包
 
         对应关系：bash---run_bash()

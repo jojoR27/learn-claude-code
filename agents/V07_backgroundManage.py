@@ -1,19 +1,22 @@
-'''V06版本的agent实现内容（基于v02版本）：
-        1.context_compact: 上下文压缩,省token,清理内存,以支持无限会话.
+'''V07版本的agent实现内容（基于v02）：
+        1.BackgroundManager类: 后台任务的核心，用线程池 + 通知队列实现异步执行。
+        （原来的subagent未融合线程管理之前：主agent给subagent分派任务之后什么都做不了等待subagent完成；当前这个后台任务管理类实现了主agent可以一次并行操作多个任务；
+          只有将subagent+BackgroundManager才真正的实现了多agent并行操作。）
 
         对应关系：bash---run_bash()
                 read_file---run_read()
                 write_file---run_write()
                 edit_file---run_edit()
-                compact---模型自己决定给出该信号量，在agent_loop映射到auto_compact方法'''
+                background_run---BackgroundManager.run()
+                check_background---BackgroundManager.check()'''
 
 
 
 import os          # os 库就是 Python 和「操作系统」对话的工具，例如读取环境变量
 import subprocess  # 让 Python 执行系统命令（cmd /bash 命令）
 from pathlib import Path  # 用于后面限制文件操作的
-import json
-import time
+import uuid  # 分配线程id?
+import threading  # 线程
 
 from anthropic import Anthropic
 from dotenv import load_dotenv  # 这是加载 .env 环境变量的工具
@@ -34,75 +37,70 @@ MODEL = os.getenv("MODEL_ID")
 WORKDIR = Path.cwd()
 
 # agent身份描述
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
-THRESHOLD = 50000
-TRANSCRIPT_DIR = WORKDIR / '.transcripts'
-KEEP_RECENT = 3
-PRESERVE_RESULT_TOOLS = {"read_file"}
+# 后台任务管理类
+class BackgroundManager:
+    def __init__(self):
+        self.tasks = {}  # 给任务分配id
+        self._notification_queue = []  # 存放已完成任务返回结果
+        self._lock = threading.Lock()
 
-def estimate_tokens(messages: list) -> int:
-    return len(str(messages)) // 4
+    # 启动线程
+    def run(self, command: str) -> str:
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        # 创建新线程，target线程要执行的操作，args线程所需参数
+        thread = threading.Thread(
+            target=self._execute, args=(task_id, command), daemon=True
+        )
+        thread.start()
+        return f"Background task {task_id} started: {command[:80]}"
 
-# 微压缩，每次对话都执行
-def micro_compact(messages: list) -> list:
-    tool_results = []
-    for msg_idx, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for part_idx, part in enumerate(msg["content"]):
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((msg_idx, part_idx, part))
-            if len(tool_results) <= KEEP_RECENT:
-                return messages
-            tool_name_map = {}
-            for msg in messages:
-                if msg["role"] == "assistant":
-                    content = msg.get("content", [])
-                    if isinstance(content, list):
-                        for block in content:
-                            if hasattr(block, "type") and block.type == "tool_use":
-                                tool_name_map[block.id] = block.name
-            to_clear = tool_results[:-KEEP_RECENT]
-            for _, _, result in to_clear:
-                if not isinstance(result.get("content"), str) or len(result["content"]) <= 100:
-                    continue
-                tool_id = result.get("tool_use_id", "")
-                tool_name = tool_name_map.get(tool_id, "unknown")
-                if tool_name in PRESERVE_RESULT_TOOLS:
-                    continue
-                result["content"] = f"[Previous: used {tool_name}]"
-            return messages
+    def _execute(self, task_id: str, command: str):
+        try:
+            r = subprocess.run(
+                command, shell =True, cwd = WORKDIR,
+                capture_output = True,text = True, timeout = 300
+            )
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = "completed"
+        except subprocess.TimeoutExpired:
+            output = "Error: Timeout (300s)"
+            status = "timeout"
+        except Exception as e:
+            output = f"Error: {e}"
+            status = "error"
+        self.tasks[task_id]["status"] = status
+        self.tasks[task_id]["result"] = output or "(no output)"
+        with self._lock:
+            self._notification_queue.append({
+                "task_id": task_id,
+                "status": status,
+                "command": command[:80],
+                "result": (output or "(no output)")[:500],
+            })
 
-# 自动全局压缩，1.LLM可以自己决定是否进行  2.超出限制自动触发
-def auto_compact(messages: list, focus: str = "") -> list:
-    # Save full transcript to disk
-    TRANSCRIPT_DIR.mkdir(exist_ok=True)
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    print(f"[transcript saved: {transcript_path}]")
-    # Ask LLM to summarize
-    conversation_text = json.dumps(messages, default=str)[-80000:]
-    focus_instruction = ""
-    if focus:
-        focus_instruction = f" Pay special attention to preserving details about: {focus}."
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity. Include: "
-            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-            "Be concise but preserve critical details."
-            f"{focus_instruction}\n\n" + conversation_text}],
-        max_tokens=2000,
-    )
-    summary = next((block.text for block in response.content if hasattr(block, "text")), "")
-    if not summary:
-        summary = "No summary generated."
-    # Replace all messages with compressed summary
-    return [
-        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
-    ]
+    # 查询任务状态
+    def check(self, task_id:str = None) -> str:
+        if task_id:
+            t = self.tasks.get(task_id)
+            if not t:
+                return f"Error: Unknown task {task_id}"
+            return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
+        lines = []
+        for tid, t in self.tasks.items():
+            lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
+        return "\n".join(lines) if lines else "No background tasks."
+
+    # agent每次调用LLM前会清空已完成任务结果队列  清空 → 保证每个后台任务结果 只告诉模型一次！
+    def drain_notification(self) -> list:
+        with self._lock:
+            notifs = list(self._notification_queue)
+            self._notification_queue.clear()
+        return notifs
+
+BG = BackgroundManager()
 
 # 强制LLM只能在当前目录操作
 def safe_path(p:str) -> Path:
@@ -175,7 +173,8 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_content"], kw["new_content"]),
-    "compact": lambda **kw: "Manual compression requested.",
+    "background_run": lambda **kw: BG.run(kw["command"]),
+    "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
 
 # 工具列表 LLM看
@@ -204,22 +203,29 @@ TOOLS = [
          "type":"object",
          "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}},
          "required": ["path", "old_text", "new_text"]}},
-    {"name": "compact",
-     "description": "Trigger manual conversation compression.",
+    {"name": "background_run",
+     "description": "Run command in background thread. Returns task_id immediately.",
      "input_schema": {
          "type": "object",
-         "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}},
+         "properties": {"command": {"type": "string"}},
+         "required": ["command"]}},
+    {"name": "check_background",
+     "description": "Check background task status. Omit task_id to list all.",
+     "input_schema": {
+         "type": "object",
+         "properties": {"task_id": {"type": "string"}}}},
 ]
 
 # 循环控制程序不断操作
 def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/上下文 同时也包括用户输入
     while True:
-        # 第一层压缩：轻量级，每次对话都执行
-        micro_compact(messages)
-        # 第二层压缩：判断是否要超出限制自动压缩
-        if estimate_tokens(messages) > THRESHOLD:
-            print("[auto_compact triggered]")
-            messages[:] = auto_compact(messages)
+        # 调用LLM前把后台任务结果队列信息注入到对话上下文里
+        notifs = BG.drain_notification()
+        if notifs and messages:
+            notif_text = "\n".join(
+                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
+            )
+            messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
         # 发给LLM生成命令  命令存到response中
         response = client.messages.create(
             model=MODEL,
@@ -234,27 +240,15 @@ def agent_loop(messages:list):  # 这里的输入是完整的对话历史记录/
         if response.stop_reason != "tool_use":
             return
         results = []
-        manual_compact = False  # 用于标记模型是否决定要压缩
-        compact_focus = ""
         for block in response.content:
             if block.type == "tool_use":
-                if block.name == "compact":
-                    manual_compact = True
-                    compact_focus = block.input.get("focus", "")
-                    output = "Compressing..."
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                handler = TOOL_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 print(f"> {block.name}:")
                 print(output[:200])
                 results.append({"type":"tool_result","tool_use_id":block.id,"content":output})
         # 把结果加入到上下文
         messages.append({"role":"user", "content":results})
-        # 第三层压缩：模型自己决定要压缩
-        if manual_compact:
-            print("[manual compact]")
-            messages[:] = auto_compact(messages, focus=compact_focus)
-            return
 
 
 if __name__ == "__main__":
@@ -262,7 +256,7 @@ if __name__ == "__main__":
     while True:  # 实现用户和agent无限聊天
         try:
             # 真正的用户输入
-            query = input("\033[36mv06>>\033[0m")
+            query = input("\033[36mv07>>\033[0m")
         except(EOFError, KeyboardInterrupt):  # 用户按ctrl+c可以退出
             break
         if query.strip().lower() in ("q", "exit", ""):  # 输入q/exit 可以退出
