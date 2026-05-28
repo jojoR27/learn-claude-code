@@ -1,6 +1,6 @@
 # Learn-Claude-Code 学习重建项目
 
-本项目是我对 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 的**个人学习复现项目**，
+本项目是我对 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 2026.5.20之前版本的**个人学习复现项目**，
 用于系统学习与实践 LLM 智能体（Agent）的核心架构，包括工具调用、上下文管理、技能系统、任务调度等关键模块。
 
 ---
@@ -29,7 +29,7 @@
 | step 5  | 子代理（Sub-agent）与任务委派 | s04 subagent | ✅ 已完成 |
 | step 6  | 外部技能系统（Skill Loader） | s05 skills | ✅ 已完成 |
 | step 7  | 三层上下文压缩（无限会话） | s06 compact | ✅ 已完成 |
-| step 8  | 后台任务与异步处理 | s08 background | ⏳ 待完成 |
+| step 8  | 后台任务与异步处理 | s08 background | ✅ 已完成 |
 | step 9  | 模块 9 | s09 | ⏳ 待完成 |
 | step 10 | 模块 10 | s10 | ⏳ 待完成 |
 | step 11 | 模块 11 | s11 | ⏳ 待完成 |
