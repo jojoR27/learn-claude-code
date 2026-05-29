@@ -4,7 +4,7 @@
     {
       "name": "alice",
       "role": "coder",
-      "status": "idle"
+      "status": "shutdown"
     },
     {
       "name": "bob",
