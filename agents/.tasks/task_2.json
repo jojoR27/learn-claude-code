@@ -1,0 +1,8 @@
+{
+  "id": 2,
+  "subject": "Refactor hello.py to use functions",
+  "description": "Refactor the hello.py script to use proper function definitions and add a main guard",
+  "status": "todo",
+  "blockedBy": [],
+  "owner": ""
+}
