@@ -1,0 +1,20 @@
+{
+  "worktrees": [
+    {
+      "name": "auth_refactor",
+      "path": "D:\\mini_claude_code\\learn-claude-code\\.worktrees\\auth_refactor",
+      "branch": "wtauth_refactor",
+      "task_id": 1,
+      "status": "active",
+      "created_at": 1780315209.2864752
+    },
+    {
+      "name": "ui_login",
+      "path": "D:\\mini_claude_code\\learn-claude-code\\.worktrees\\ui_login",
+      "branch": "wtui_login",
+      "task_id": 2,
+      "status": "active",
+      "created_at": 1780315209.5391111
+    }
+  ]
+}

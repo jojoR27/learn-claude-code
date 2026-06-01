@@ -1,0 +1,11 @@
+{
+  "id": 1,
+  "subject": "Auth refactor",
+  "description": "",
+  "status": "in_progress",
+  "owner": "",
+  "worktree": "auth_refactor",
+  "blockedBy": [],
+  "created_at": 1780315204.6088574,
+  "updated_at": 1780315209.293711
+}

@@ -1,0 +1,11 @@
+{
+  "id": 2,
+  "subject": "UI login",
+  "description": "",
+  "status": "in_progress",
+  "owner": "",
+  "worktree": "ui_login",
+  "blockedBy": [],
+  "created_at": 1780315204.6098669,
+  "updated_at": 1780315209.5474837
+}
