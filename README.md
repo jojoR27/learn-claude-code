@@ -20,20 +20,21 @@
 
 ## 我的学习路线（已按个人节奏调整）
 
-| 步骤      | 模块/主题 | 对应原项目 | 状态    |
-|:--------| :--- | :--- |:------|
-| step 1  | 开发环境搭建 & 基础客户端配置 | 环境 | ✅ 已完成 |
-| step 2  | 基础工具循环（bash / read_file / write_file） | s01 + s02 | ✅ 已完成 |
-| step 3  | Todo 管理与简单任务循环 | s03 todo | ✅ 已完成 |
-| step 4  | 任务系统（Task System） | s07 task system | ✅ 已完成 |
-| step 5  | 子代理（Sub-agent）与任务委派 | s04 subagent | ✅ 已完成 |
-| step 6  | 外部技能系统（Skill Loader） | s05 skills | ✅ 已完成 |
-| step 7  | 三层上下文压缩（无限会话） | s06 compact | ✅ 已完成 |
-| step 8  | 后台任务与异步处理 | s08 background | ✅ 已完成 |
-| step 9  | 模块 9 | s09 | ⏳ 待完成 |
-| step 10 | 模块 10 | s10 | ⏳ 待完成 |
-| step 11 | 模块 11 | s11 | ⏳ 待完成 |
-| step 12 | 模块 12 | s12 | ⏳ 待完成 |
+| 步骤      | 模块/主题                                 | 对应原项目           | 状态     |
+|:--------|:--------------------------------------|:----------------|:-------|
+| step 1  | 开发环境搭建 & 基础客户端配置                      | 环境              | ✅ 已完成  |
+| step 2  | 基础工具循环（bash / read_file / write_file） | s01 + s02       | ✅ 已完成  |
+| step 3  | Todo 管理与简单任务循环                        | s03 todo        | ✅ 已完成  |
+| step 4  | 任务系统（Task System）                     | s07 task system | ✅ 已完成  |
+| step 5  | 子代理（Sub-agent）与任务委派                   | s04 subagent    | ✅ 已完成  |
+| step 6  | 外部技能系统（Skill Loader）                  | s05 skills      | ✅ 已完成  |
+| step 7  | 三层上下文压缩（无限会话）                         | s06 compact     | ✅ 已完成  |
+| step 8  | 后台任务与异步处理                             | s08 background  | ✅ 已完成  |
+| step 9  | 模块 9                                  | s09             | ✅ 已完成  |
+| step 10 | 模块 10                                 | s10             | ✅ 已完成  |
+| step 11 | 模块 11                                 | s11             | ✅ 已完成  |
+| step 12 | 模块 12                                 | s12             | ✅ 已完成  |
+| step 13 | 整合                             | |  ⏳ 待完成 |
 
 ---
 
