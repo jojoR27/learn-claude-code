@@ -8,13 +8,11 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from queue import Queue
 import threading
 import time
 import uuid
 from typing import Optional
 
-import yaml
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -211,17 +209,31 @@ class TaskManager:
     def exists(self, task_id: int) -> bool:
         return self._path(task_id).exists()
 
-    def update(self, task_id: int, status: str = None, owner: str = None) -> str:
+    def update(self, task_id: int, status: str = None, owner: str = None,
+               add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
         task = self._load(task_id)
         if status:
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Invalid status: {status}")
             task["status"] = status
+            if status == "completed":
+                self._clear_dependency(task_id)
+            if add_blocked_by:
+                task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+            if remove_blocked_by:
+                task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
             if owner is not None:
                task["owner"] = owner
             task["updated_at"] = time.time()
             self._save(task)
             return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def _clear_dependency(self, completed_id: int):
+        for f in self.dir.glob("task_*.json"):
+            task = json.loads(f.read_text())
+            if completed_id in task.get("blockedBy", []):
+                task["blockedBy"].remove(completed_id)
+                self._save(task)
 
     def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
         task = self._load(task_id)
@@ -548,56 +560,36 @@ class TodoManager:
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
+    def has_open_items(self) -> bool:
+        return any(item.get("status") != "completed" for item in self.items)
+
 # --------------------------------v05-----------------------------------
 # 加载外挂工具包
 class SkillLoader:
     def __init__(self, skills_dir: Path):
-        self.skills_dir = skills_dir
         self.skills = {}
-        print("[SkillLoader] 开始加载技能...")
-        self._load_all()
-        print(f"[SkillLoader] 加载完成！可用技能：{list(self.skills.keys())}")
+        if skills_dir.exists():
+            for f in sorted(skills_dir.rglob("SKILL.md")):
+                text = f.read_text()
+                match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+                meta, body = {}, text
+                if match:
+                    for line in match.group(1).strip().splitlines():
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            meta[k.strip()] = v.strip()
+                    body = match.group(2).strip()
+                name = meta.get("name", f.parent.name)
+                self.skills[name] = {"meta": meta, "body": body}
 
-    def _load_all(self):
-        if not self.skills_dir.exists():
-            print("[SkillLoader] 警告：skills 文件夹不存在！")
-            return
-        print(f"[SkillLoader] 找到技能目录：{self.skills_dir}")
-        for f in sorted(self.skills_dir.rglob("SKILL.md")):
-            print(f"[SkillLoader] 发现技能文件：{f}")
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
+    def descriptions(self) -> str:
+        if not self.skills: return "(no skills)"
+        return "\n".join(f"  - {n}: {s['meta'].get('description', '-')}" for n, s in self.skills.items())
 
-    def _parse_frontmatter(self, text: str) -> tuple:
-        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-        if not match:
-            return {}, text
-        try:
-            meta = yaml.safe_load(match.group(1)) or {}
-        except yaml.YAMLError:
-            meta = {}
-        return meta, match.group(2).strip()
-
-    def get_descriptions(self) -> str:
-        if not self.skills:
-            return "(no skills available)"
-        lines = []
-        for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "No description")
-            tags = skill["meta"].get("tags", "")
-            line = f"  - {name}: {desc}"
-            if tags:
-                line += f" [{tags}]"
-            lines.append(line)
-        return "\n".join(lines)
-
-    def get_content(self, name: str) -> str:
-        skill = self.skills.get(name)
-        if not skill:
-            return f"Error: Unknown skill: '{name}'. Available: {','.join(self.skills.keys())}"
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+    def load(self, name: str) -> str:
+        s = self.skills.get(name)
+        if not s: return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
 
 # --------------------------------v06--------------------------------
 # 上下文压缩
@@ -670,7 +662,7 @@ class BackgroundManager:
         self._notification_queue = []
         self._lock = threading.Lock()
 
-    def run(self, command: str) -> str:
+    def run(self, command: str, timeout: int = 120) -> str:
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
         thread = threading.Thread(
@@ -824,7 +816,7 @@ class TeammateManager:
     def _save_config(self):
         self.config_path.write_text(json.dumps(self.config, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def _find_member(self, name: str) -> dict:
+    def _find_member(self, name: str) -> Optional[dict]:
         for member in self.config["members"]:
             if member["name"] == name:
                 return member
@@ -1091,12 +1083,254 @@ def check_shutdown_status(request_id: str) -> str:
 # 全局实例
 TODO = TodoManager()
 SKILLS = SkillLoader(SKILLS_DIR)
-TASK_MGR = TaskManager()
+TASK_MGR = TaskManager(TASKS_DIR)
 BG = BackgroundManager()
-BUS = MessageBus()
-TEAM = TeammateManager(BUS, TASK_MGR)
+BUS = MessageBus(INBOX_DIR)
+TEAM = TeammateManager(TEAM_DIR)
+EVENTS = EventBus(WORKDIR / ".worktrees"/ "events.jsonl")
+WORKTREES = WorktreeManager(WORKDIR / ".tasks", TASK_MGR, EVENTS)
 
 # prompt
-SYSTEM =
+SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
+            Prefer task_create/task_update/task_list for multi-step work.
+            Use TodoWrite for short checklists.
+            Use task for subagent delegation.
+            Use load_skill for specialized knowledge.
+            Skills: {SKILLS.descriptions()}"""
 
 
+# 工具映射表
+TOOL_HANDLERS = {
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_content"], kw["new_content"]),
+    "TodoWrite": lambda **kw: TODO.update(kw["items"]),
+    "load_skill": lambda **kw: SKILLS.load(kw["name"]),
+    "compress": lambda **kw: "Compressing...",
+    "background_run": lambda **kw: BG.run(kw["command"], kw.get("timeout", 120)),
+    "check_background": lambda **kw: BG.check(kw.get("task_id")),
+    "task_create": lambda **kw: TASK_MGR.create(kw["subject"], kw.get("description", "")),
+    "task_get": lambda **kw: TASK_MGR.get(kw["task_id"]),
+    "task_update": lambda **kw: TASK_MGR.update(kw["task_id"], kw.get("status"), kw.get("owner"), kw.get("add_blocked_by"), kw.get("remove_blocked_by")),
+    "task_list": lambda **kw: TASK_MGR.list_all(),
+    "task_bind_worktree": lambda **kw: TASK_MGR.bind_worktree(kw["task_id"], kw["worktree"], kw.get("owner", "")),
+    "worktree_create": lambda **kw: WORKTREES.create(kw["name"], kw.get("task_id"), kw.get("base_ref", "HEAD")),
+    "worktree_list": lambda **kw: WORKTREES.list_all(),
+    "worktree_status": lambda **kw: WORKTREES.status(kw["name"]),
+    "worktree_run": lambda **kw: WORKTREES.run(kw["name"], kw["command"]),
+    "worktree_keep": lambda **kw: WORKTREES.keep(kw["name"]),
+    "worktree_remove": lambda **kw: WORKTREES.remove(kw["name"], kw.get("force", False),
+                                                     kw.get("complete_task", False)),
+    "worktree_events": lambda **kw: EVENTS.list_recent(kw.get("limit", 20)),
+    "spawn_teammate": lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
+    "list_teammates": lambda **kw: TEAM.list_all(),
+    "send_message": lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
+    "read_inbox": lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
+    "broadcast": lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "shutdown_request": lambda **kw: handle_shutdown_request(kw["teammate"]),
+    "shutdown_response": lambda **kw: check_shutdown_status(kw["request_id"]),
+    "plan_approval": lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
+    "idle": lambda **kw: "Lead does not idle.",
+    "claim_task": lambda **kw: claim_task(kw["task_id"], "lead"),
+}
+
+# TOOLS
+TOOLS = [
+    {"name": "bash", "description": "Run a shell command.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "read_file", "description": "Read file contents.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+    {"name": "write_file", "description": "Write content to file.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "edit_file", "description": "Replace exact text in file.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_content": {"type": "string"}, "new_content": {"type": "string"}}, "required": ["path", "old_content", "new_content"]}},
+    {"name": "TodoWrite", "description": "Update task tracking list.",
+     "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
+    {"name": "task", "description": "Spawn a subagent for isolated exploration or work.",
+     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "agent_type": {"type": "string", "enum": ["Explore", "general-purpose"]}}, "required": ["prompt"]}},
+    {"name": "load_skill", "description": "Load specialized knowledge by name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "compress", "description": "Manually compress conversation context.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "background_run", "description": "Run command in background thread.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}},
+    {"name": "check_background", "description": "Check background task status.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
+    {"name": "task_create", "description": "Create a persistent file task.",
+     "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
+    {"name": "task_get", "description": "Get task details by ID.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+    {"name": "task_update", "description": "Update task status or dependencies or owner.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}, "owner": {"type": "string"}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "remove_blocked_by": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
+    {"name": "task_list", "description": "List all tasks.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "spawn_teammate", "description": "Spawn a persistent autonomous teammate.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
+    {"name": "list_teammates", "description": "List all teammates.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "send_message", "description": "Send a message to a teammate.",
+     "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+    {"name": "read_inbox", "description": "Read and drain the lead's inbox.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "broadcast", "description": "Send message to all teammates.",
+     "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+    {"name": "shutdown_request", "description": "Request a teammate to shut down.",
+     "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
+    {"name": "shutdown_response",
+     "description": "Check the status of a shutdown request by request_id.",
+     "input_schema": {
+         "type": "object",
+         "properties": {"request_id": {"type": "string"}},
+         "required": ["request_id"]}},
+    {"name": "plan_approval", "description": "Approve or reject a teammate's plan.",
+     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
+    {"name": "idle", "description": "Enter idle state.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "claim_task",
+     "description": "Claim a task from the board by ID.",
+     "input_schema": {
+         "type": "object",
+         "properties": {"task_id": {"type": "integer"}},
+         "required": ["task_id"]}},
+    {"name": "task_bind_worktree",
+     "description": "Bind a task to a worktree name.",
+     "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "integer"},"worktree": {"type": "string"},"owner": {"type": "string"},},
+            "required": ["task_id", "worktree"],},},
+    {"name": "worktree_create",
+     "description": "Create a git worktree and optionally bind it to a task.",
+     "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "task_id": {"type": "integer"},
+            "base_ref": {"type": "string"},},
+        "required": ["name"],},},
+    {"name": "worktree_list",
+     "description": "List worktrees tracked in .worktrees/index.json.",
+     "input_schema": {"type": "object", "properties": {}},},
+    {"name": "worktree_status",
+     "description": "Show git status for one worktree.",
+     "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],},},
+    {"name": "worktree_run",
+     "description": "Run a shell command in a named worktree directory.",
+     "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "command": {"type": "string"},},
+            "required": ["name", "command"],},},
+    {"name": "worktree_remove",
+     "description": "Remove a worktree and optionally mark its bound task completed.",
+     "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "force": {"type": "boolean"},
+                "complete_task": {"type": "boolean"},},
+            "required": ["name"],},},
+    {"name": "worktree_keep",
+     "description": "Mark a worktree as kept in lifecycle state without removing it.",
+     "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],},},
+    {"name": "worktree_events",
+     "description": "List recent worktree/task lifecycle events from .worktrees/events.jsonl.",
+     "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer"}},},},
+]
+
+# agent_loop
+def agent_loop(messages: list):
+    rounds_without_todo = 0
+    while True:
+        # v06
+        micro_compact(messages)
+        if estimate_tokens(messages) > TOKEN_THRESHOLD:
+            print("[auto-compact triggered]")
+            messages[:] = auto_compact(messages)
+        # v07
+        notifs = BG.drain_notification()
+        if notifs:
+            txt = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
+            messages.append({"role": "user", "content": f"<background-results>\n{txt}\n</background-results>"})
+        # s10: check lead inbox
+        inbox = BUS.read_inbox("lead")
+        if inbox:
+            messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})
+        # LLM call
+        response = client.messages.create(
+            model=MODEL, system=SYSTEM, messages=messages,
+            tools=TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return
+
+        results = []
+        used_todo = False
+        manual_compress = False
+        for block in response.content:
+            if block.type == "tool_use":
+                if block.name == "compress":
+                    manual_compress = True
+                handler = TOOL_HANDLERS.get(block.name)
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+                print(f"> {block.name}:")
+                print(str(output)[:200])
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                if block.name == "TodoWrite":
+                    used_todo = True
+        # s03:
+        rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
+        if TODO.has_open_items() and rounds_without_todo >= 3:
+            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+        messages.append({"role": "user", "content": results})
+        # s06: manual compress
+        if manual_compress:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
+            return
+
+
+if __name__ == "__main__":
+    history = []
+    while True:
+        try:
+            query = input("\033[36mv_full >> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
+        if query.strip() == "/compact":
+            if history:
+                print("[manual compact via /compact]")
+                history[:] = auto_compact(history)
+            continue
+        if query.strip() == "/tasks":
+            print(TASK_MGR.list_all())
+            continue
+        if query.strip() == "/team":
+            print(TEAM.list_all())
+            continue
+        if query.strip() == "/inbox":
+            print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            continue
+        history.append({"role": "user", "content": query})
+        agent_loop(history)
+        response_content = history[-1]["content"]
+        if isinstance(response_content, list):
+            for block in response_content:
+                if hasattr(block, "text"):
+                    print(block.text)
+        print()
